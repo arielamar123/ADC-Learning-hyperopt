@@ -1,7 +1,7 @@
 # Deep Task-Based Analog-to-Digital Conversion
 
 
-<img src='imgs/HybridDNN_ADC3.png' height=500 width=700>
+<img src='imgs/HybridDNN_ADC3.png' height=400 width=1000>
 
 ## Prerequisites:
 ```
