@@ -1,4 +1,4 @@
-#Deep Task-Based Analog-to-Digital Conversion
+# Deep Task-Based Analog-to-Digital Conversion
 
 
 <img src='imgs/HybridDNN_ADC3.png'>
