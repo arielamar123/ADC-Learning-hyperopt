@@ -1,10 +1,12 @@
+import argparse
+
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from ax.plot.trace import optimization_trace_single_method
@@ -13,51 +15,7 @@ from ax.plot.contour import plot_contour
 from ax.plot.render import plot_config_to_html
 from ax.utils.report.render import render_report_elements
 from scipy.io import savemat
-from ax import SumConstraint
-from ax import RangeParameter
-from ax import ParameterType
-
-###########################
-# Parmeters Intialization #
-###########################
-
-
-num_rx_antenas = 6 # Number of Rx antennas
-dense_sampling_L = 20  # Observed discretized time frame
-num_transmitted_symbols = 4 # Number of transmitted symbols
-valid_percent = 0.3  # Percentage of training data used for validation
-train_size = int(1e4)
-validation_size = int(train_size * valid_percent)
-test_size = int(1e4)
-num_of_channels = 1  # 1 - Gaussian channel
-BPSK_symbols = [-1, 1]  # BPSK symbols
-error_variance = 0.1  # error variance for csi uncertainty
-frame_size = 200
-f_0 = 1e3
-w = 2 * np.pi * f_0
-snr_vals = 10 ** (-0.1 * np.arange(13))
-epochs = 30
-batch_size = 10
-time_vec = np.arange(1, dense_sampling_L + 1) / dense_sampling_L
-channel_matrix_cos = 1 + 0.5 * np.cos(time_vec)
-gaussian_sampling_std = 0.4
-noise_vector = 1 + 0.3 * np.cos(1.5 * (np.arange(1, dense_sampling_L + 1)) + 0.2)
-
-if torch.cuda.is_available():
-    dev = "cuda:0"
-else:
-    dev = "cpu"
-device = torch.device(dev)
-print(device)
-
-BITS_ERR_MSG = '**************too much bits*****************'
-###########################
-# channel matrix creation #
-###########################
-
-
-channel_matrix_exp = np.exp(-np.abs(np.ones((num_rx_antenas, 1)) * np.arange(num_transmitted_symbols) - (
-        np.ones((num_transmitted_symbols, 1)) * [np.arange(num_rx_antenas)]).T))
+import scipy.io as sio
 
 
 def create_received_signal(data, ro=1):
@@ -70,8 +28,8 @@ def create_received_signal(data, ro=1):
     :param ro: SNR
     :return: x(t) = G(t)*s+w(t) (n*L, N)
     '''
-    channel_matrix = np.zeros((num_rx_antenas * dense_sampling_L, data.shape[1]))
-    for t in range(dense_sampling_L):
+    channel_matrix = np.zeros((num_rx_antenas * params.dense_sampling_L, data.shape[1]))
+    for t in range(params.dense_sampling_L):
         signal = np.dot(channel_matrix_cos[t] * channel_matrix_exp, data)
         channel_matrix[num_rx_antenas * t:num_rx_antenas * (t + 1), :] = np.sqrt(
             ro) * signal + np.random.randn(
@@ -91,21 +49,22 @@ def create_received_signal_uncertanity_error(data, ro=1):
     :return: x(t) = G(t)*s+w(t) (n*L, N)
     '''
 
-    noisy_channel_matrix = np.zeros((num_rx_antenas * dense_sampling_L, data.shape[1]))
-    for t in range(dense_sampling_L):
+    noisy_channel_matrix = np.zeros((num_rx_antenas * params.dense_sampling_L, data.shape[1]))
+    for t in range(params.dense_sampling_L):
         noisy_channel_matrix[num_rx_antenas * t:num_rx_antenas * (t + 1), :] = np.random.randn(
             num_rx_antenas,
             data.shape[1])
 
-    noisy_recieved_signal = np.zeros((num_rx_antenas * dense_sampling_L, data.shape[1]))
-    for t in range(dense_sampling_L):
+    noisy_recieved_signal = np.zeros((num_rx_antenas * params.dense_sampling_L, data.shape[1]))
+    for t in range(params.dense_sampling_L):
         signal = np.zeros((num_rx_antenas, data.shape[1]))
         noisy_channel_matrix_exp = channel_matrix_exp * (
-                1 + np.sqrt(error_variance) * np.random.randn(channel_matrix_exp.shape[0],
-                                                              channel_matrix_exp.shape[1]))
-        for f in range(data.shape[1] // frame_size):
-            signal[:, f * frame_size:(f + 1) * frame_size] = np.dot(channel_matrix_cos[t] * noisy_channel_matrix_exp,
-                                                                    data[:, f * frame_size:(f + 1) * frame_size])
+                1 + np.sqrt(params.error_variance) * np.random.randn(channel_matrix_exp.shape[0],
+                                                                     channel_matrix_exp.shape[1]))
+        for f in range(data.shape[1] // params.frame_size):
+            signal[:, f * params.frame_size:(f + 1) * params.frame_size] = np.dot(
+                channel_matrix_cos[t] * noisy_channel_matrix_exp,
+                data[:, f * params.frame_size:(f + 1) * params.frame_size])
         noisy_recieved_signal[num_rx_antenas * t:num_rx_antenas * (t + 1), :] = np.sqrt(ro) * signal
     return noisy_recieved_signal + noisy_channel_matrix
 
@@ -117,7 +76,7 @@ def create_received_signal_uncertanity_error(data, ro=1):
 class AnalogNetwork(nn.Module):
     def __init__(self, num_of_adc_p):
         super(AnalogNetwork, self).__init__()
-        self.analog_filter = nn.Linear(num_rx_antenas * dense_sampling_L, num_of_adc_p * dense_sampling_L,
+        self.analog_filter = nn.Linear(num_rx_antenas * params.dense_sampling_L, num_of_adc_p * params.dense_sampling_L,
                                        bias=False).double()  # without bias to get only the matrix
 
     def forward(self, x):
@@ -128,19 +87,19 @@ class AnalogNetwork(nn.Module):
 class SamplingLayer(nn.Module):
     def __init__(self, num_of_adc_p, num_samples_L_tilde):
         super(SamplingLayer, self).__init__()
-        start_samples = np.linspace(0, dense_sampling_L, num_samples_L_tilde + 2, dtype=np.float64)
+        start_samples = np.linspace(0, params.dense_sampling_L, num_samples_L_tilde + 2, dtype=np.float64)
         self.weight = torch.nn.Parameter(data=torch.from_numpy(start_samples[1:-1]), requires_grad=True)
         self.num_of_adc_p = num_of_adc_p
         self.num_samples_L_tilde = num_samples_L_tilde
 
     def forward(self, x):
         out = torch.zeros((len(x), self.num_samples_L_tilde * self.num_of_adc_p)).double().to(device)
-        t = torch.from_numpy(np.arange(1, dense_sampling_L + 1, dtype=np.double)).to(device)
-        for v, j in enumerate(range(0, dense_sampling_L * self.num_of_adc_p, dense_sampling_L)):
+        t = torch.from_numpy(np.arange(1, params.dense_sampling_L + 1, dtype=np.double)).to(device)
+        for v, j in enumerate(range(0, params.dense_sampling_L * self.num_of_adc_p, params.dense_sampling_L)):
             for k in range(self.num_samples_L_tilde):
                 out[:, v * self.num_samples_L_tilde + k] = torch.sum(
-                    x[:, j:j + dense_sampling_L] * torch.exp(
-                        -(t - self.weight[k]) ** 2 / gaussian_sampling_std ** 2), dim=1)
+                    x[:, j:j + params.dense_sampling_L] * torch.exp(
+                        -(t - self.weight[k]) ** 2 / params.gaussian_sampling_std ** 2), dim=1)
         return out
 
 
@@ -151,7 +110,7 @@ class HardSamplingLayer(nn.Module):
         weight = np.round(weight)
         rounded_weight = torch.from_numpy(weight)
         rounded_weight[rounded_weight < 1] = 1
-        rounded_weight[rounded_weight > dense_sampling_L] = dense_sampling_L - 1
+        rounded_weight[rounded_weight > params.dense_sampling_L] = params.dense_sampling_L - 1
         self.weight = rounded_weight.long()
         self.num_of_adc_p = num_of_adc_p
         self.num_samples_L_tilde = num_samples_L_tilde
@@ -160,11 +119,7 @@ class HardSamplingLayer(nn.Module):
         out = torch.zeros((len(x), self.num_samples_L_tilde * self.num_of_adc_p)).double().to(device)
         for i in range(self.num_of_adc_p):
             for j in range(self.num_samples_L_tilde):
-                # try:
-                out[:, i * self.num_samples_L_tilde + j] = x[:, i * dense_sampling_L + self.weight[j]]
-                # except:
-                #     print('*******ERROR******** ', self.weight)
-                #     exit(1)
+                out[:, i * self.num_samples_L_tilde + j] = x[:, i * params.dense_sampling_L + self.weight[j]]
         return out
 
 
@@ -251,217 +206,245 @@ class ADCNet(nn.Module):
         return x
 
 
-def train(detector, parameters, training_set):
-    validation_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, validation_size), p=[0.5, 0.5])
+class LoadData(Dataset):
+    def __init__(self, data):
+        super(LoadData, self).__init__()
+        self.data = data
 
-    labels_validation = np.sum(0.5 * (validation_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)),
-                               axis=1).astype(np.long)
+    def __len__(self):
+        return len(self.data)
 
-    validation_samples = detector(validation_data, ro_train).T
-    validation_set = []
+    def __getitem__(self, idx):
+        return self.data[idx]
 
-    for i in range(len(validation_samples)):
-        validation_set.append([validation_samples[i], labels_validation[i]])
 
-    # num_of_adc_p = 2.0 ** parameters['num_of_adc_p']
-    #num_of_adc_p = 4
-    num_of_adc_p = 1
-    num_samples_L_tilde = 2.0 ** parameters['num_samples_L_tilde']
-    num_code_words = 2.0 ** (2.0 ** parameters['num_code_words'])
+class Trainer(object):
 
-    print('p: ', num_of_adc_p, ', actual: ', int(round(num_of_adc_p)))
-    print('L: ', num_samples_L_tilde, ', actual: ', int(round(num_samples_L_tilde)))
-    print('code_words: ', num_code_words, 'bits: ', int(round(np.log2(num_code_words))))
-    overall_bits = int(round(num_of_adc_p)) * int(round(num_samples_L_tilde)) * int(round(np.log2(num_code_words)))
-    print('overall bits: ', overall_bits)
-    net = ADCNet(int(round(num_of_adc_p)), int(round(num_samples_L_tilde)), int(round(num_code_words)),
-                 np.max(labels_train), np.max(train_samples)).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(net.parameters(), lr=1e-3)
+    def __init__(self, train_loader):
+        self.train_loader = train_loader
 
-    valid_loss_min = np.Inf
-    val_net = deepcopy(net)
-    for epoch in tqdm(range(epochs)):
-        # keep track of training and validation loss
-        train_loss = 0.0
-        valid_loss = 0.0
-        ###################
-        # train the model #
-        ###################
-        net.train()
-        for i, data in tqdm(enumerate(DataLoader(training_set, batch_size=batch_size))):
-            inputs, labels = data
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            # clear the gradients of all optimized variables
-            optimizer.zero_grad()
-            # forward pass: compute predicted outputs by passing inputs to the model
-            outputs = net(inputs)
-            # calculate the batch loss
-            loss = criterion(outputs, labels.long())
-            # backward pass: compute gradient of the loss with respect to model parameters
-            loss.backward()
-            # perform a single optimization step (parameter update)
-            optimizer.step()
-            # update training loss
-            train_loss += loss.item() * batch_size
-        ######################
-        # validate the model #
-        ######################
-        net_val = net
-        net_val.eval()
-        with torch.no_grad():
-            net_val.sampling_layer = HardSamplingLayer(net.sampling_layer.weight, int(round(num_of_adc_p)),
-                                                       int(round(num_samples_L_tilde)))
-            net_val.quantization_layer = HardQuantizationLayer(net.quantization_layer.a, net.quantization_layer.b,
-                                                               net.quantization_layer.c, int(round(num_code_words)))
-            for i, data in tqdm(enumerate(DataLoader(validation_set, batch_size=batch_size))):
+    def train(self, detector, parameters):
+        validation_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, validation_size), p=[0.5, 0.5])
+
+        labels_validation = np.sum(0.5 * (validation_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)),
+                                   axis=1).astype(int)
+
+        validation_samples = detector(validation_data, ro_train).T
+        validation_set = []
+
+        for i in range(len(validation_samples)):
+            validation_set.append([validation_samples[i], labels_validation[i]])
+        validation_set = LoadData(validation_set)
+        validation_loader = DataLoader(validation_set, batch_size=params.batch_size)
+        num_of_adc_p = int(round(2.0 ** parameters['num_of_adc_p']))
+        num_samples_L_tilde = int(round(2.0 ** parameters['num_samples_L_tilde']))
+        num_code_words = int(round(2.0 ** round(2.0 ** (parameters['num_code_words']))))
+
+        print('p: ', num_of_adc_p)
+        print('L: ', num_samples_L_tilde)
+        print('code_words: ', num_code_words)
+        overall_bits = num_of_adc_p * num_samples_L_tilde * int(round(np.log2(num_code_words)))
+        print('overall bits: ', overall_bits)
+        net = ADCNet(num_of_adc_p, num_samples_L_tilde, num_code_words,
+                     np.max(labels_train), np.max(train_samples)).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(net.parameters(), lr=params.lr)
+
+        valid_loss_min = np.Inf
+        val_net = deepcopy(net)
+
+        for epoch in tqdm(range(params.epochs)):
+            # keep track of training and validation loss
+            train_loss = 0.0
+            valid_loss = 0.0
+            ###################
+            # train the model #
+            ###################
+            net.train()
+            for i, data in tqdm(enumerate(self.train_loader)):
                 inputs, labels = data
                 inputs = inputs.to(device)
                 labels = labels.to(device)
+                # clear the gradients of all optimized variables
+                optimizer.zero_grad()
                 # forward pass: compute predicted outputs by passing inputs to the model
-                outputs = net_val(inputs)
+                outputs = net(inputs)
                 # calculate the batch loss
                 loss = criterion(outputs, labels.long())
-                # update validation loss
-                valid_loss += loss.item() * batch_size
-            train_loss = train_loss / train_size
-            valid_loss = valid_loss / validation_size
-            print('Epoch: {} \tTraining Loss: {:.6f} \tValidation Loss: {:.6f}'.format(
-                epoch, train_loss, valid_loss))
+                # backward pass: compute gradient of the loss with respect to model parameters
+                loss.backward()
+                # perform a single optimization step (parameter update)
+                optimizer.step()
+                # update training loss
+                train_loss += loss.item() * params.batch_size
+            ######################
+            # validate the model #
+            ######################
+            net_val = net
+            net_val.eval()
+            with torch.no_grad():
+                net_val.sampling_layer = HardSamplingLayer(net.sampling_layer.weight, num_of_adc_p,
+                                                           num_samples_L_tilde)
+                net_val.quantization_layer = HardQuantizationLayer(net.quantization_layer.a, net.quantization_layer.b,
+                                                                   net.quantization_layer.c, num_code_words)
+                for i, data in tqdm(enumerate(validation_loader)):
+                    inputs, labels = data
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+                    # forward pass: compute predicted outputs by passing inputs to the model
+                    outputs = net_val(inputs)
+                    # calculate the batch loss
+                    loss = criterion(outputs, labels.long())
+                    # update validation loss
+                    valid_loss += loss.item() * params.batch_size
+                train_loss = train_loss / params.train_size
+                valid_loss = valid_loss / validation_size
+                print('Epoch: {} \tTraining Loss: {:.6f} \tValidation Loss: {:.6f}'.format(
+                    epoch, train_loss, valid_loss))
 
-            # save model if validation loss has decreased
-            if valid_loss <= valid_loss_min:
-                print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model ...'.format(
-                    valid_loss_min,
-                    valid_loss))
-                val_net = net
-                valid_loss_min = valid_loss
-    return val_net
+                # save model if validation loss has decreased
+                if valid_loss <= valid_loss_min:
+                    print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model ...'.format(
+                        valid_loss_min,
+                        valid_loss))
+                    val_net = net
+                    valid_loss_min = valid_loss
+        return val_net
+
+    def evaluate(self, parameters, net, alpha):
+        BER = []
+
+        num_of_adc_p = int(round(2.0 ** parameters['num_of_adc_p']))
+        num_samples_L_tilde = int(round(2.0 ** parameters['num_samples_L_tilde']))
+        num_code_words = int(round(2.0 ** round(2.0 ** (parameters['num_code_words']))))
+        overall_bits = num_of_adc_p * num_samples_L_tilde * int(round(np.log2(num_code_words)))
+
+        test_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, params.test_size), p=[0.5, 0.5])
+        labels_test = np.sum(0.5 * (test_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)), axis=1).astype(
+            int)
+        for r, ro in enumerate(np.flip(snr_vals)):
+
+            test_samples = create_received_signal(test_data, ro).T
+            test_set = []
+
+            for i in range(len(test_samples)):
+                test_set.append([test_samples[i], labels_test[i]])
+            test_set = LoadData(test_set)
+            test_loader = DataLoader(test_set, batch_size=params.batch_size, num_workers=num_workers)
+            best_net = net
+            net_test = best_net
+
+            print('p: ', num_of_adc_p)
+            print('L: ', num_samples_L_tilde, )
+            print('code_words: ', num_code_words)
+            print('overall bits: ', overall_bits)
+
+            net_test.eval()
+            net_test.sampling_layer = HardSamplingLayer(best_net.sampling_layer.weight, num_of_adc_p,
+                                                        num_samples_L_tilde)
+            net_test.quantization_layer = HardQuantizationLayer(best_net.quantization_layer.a,
+                                                                best_net.quantization_layer.b,
+                                                                best_net.quantization_layer.c, num_code_words)
+            with torch.no_grad():
+                cur_error = []
+                for i, data in tqdm(enumerate(test_loader)):
+                    inputs, labels = data
+                    inputs = inputs.to(device)
+                    net_outputs = net_test(inputs)
+                    outputs = net_outputs.argmax(dim=1)
+                    power = 2 ** np.flip(np.arange(num_transmitted_symbols))
+                    est_ber = np.floor((outputs.cpu().numpy()[:, None] % (2 * power)) / power).T
+                    est_ber_scale = 2 * est_ber - np.ones((num_transmitted_symbols, params.batch_size))
+                    cur_error.append(
+                        np.mean(
+                            np.mean(est_ber_scale != test_data[:, i * params.batch_size:(i + 1) * params.batch_size],
+                                    axis=0)))
+                BER.append(sum(cur_error) / len(cur_error))
+        return sum(BER) / len(BER) + alpha * overall_bits
+
+    def evaluate_plot(self, parameters, net):
+        BER = []
+        test_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, params.test_size), p=[0.5, 0.5])
+        labels_test = np.sum(0.5 * (test_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)), axis=1).astype(
+            int)
+        for r, ro in enumerate(np.flip(snr_vals)):
+            test_samples = create_received_signal(test_data, ro).T
+            test_set = []
+
+            for i in range(len(test_samples)):
+                test_set.append([test_samples[i], labels_test[i]])
+            test_set = LoadData(test_set)
+            test_loader = DataLoader(test_set, batch_size=params.batch_size)
+            best_net = net
+            net_test = deepcopy(best_net)
+
+            num_of_adc_p = int(round(2.0 ** parameters['num_of_adc_p']))
+            num_samples_L_tilde = int(round(2.0 ** parameters['num_samples_L_tilde']))
+            num_code_words = int(round(2.0 ** round(2.0 ** (parameters['num_code_words']))))
+
+            print('p: ', num_of_adc_p)
+            print('L: ', num_samples_L_tilde)
+            print('code_words: ', num_code_words)
+            overall_bits = num_of_adc_p * num_samples_L_tilde * int(round(np.log2(num_code_words)))
+            print('overall bits: ', overall_bits)
+
+            net_test.eval()
+            net_test.sampling_layer = HardSamplingLayer(best_net.sampling_layer.weight, num_of_adc_p,
+                                                        num_samples_L_tilde)
+            net_test.quantization_layer = HardQuantizationLayer(best_net.quantization_layer.a,
+                                                                best_net.quantization_layer.b,
+                                                                best_net.quantization_layer.c, num_code_words)
+            with torch.no_grad():
+                cur_error = []
+                for i, data in tqdm(enumerate(test_loader)):
+                    inputs, labels = data
+                    inputs = inputs.to(device)
+                    net_outputs = net_test(inputs)
+                    outputs = net_outputs.argmax(dim=1)
+                    power = 2 ** np.flip(np.arange(num_transmitted_symbols))
+                    est_ber = np.floor((outputs.cpu().numpy()[:, None] % (2 * power)) / power).T
+                    est_ber_scale = 2 * est_ber - np.ones((num_transmitted_symbols, params.batch_size))
+                    cur_error.append(
+                        np.mean(
+                            np.mean(est_ber_scale != test_data[:, i * params.batch_size:(i + 1) * params.batch_size],
+                                    axis=0)))
+                BER.append(sum(cur_error) / len(cur_error))
+        print('The BER for this trial:', BER)
+        return BER
 
 
-def evaluate(parameters, net, alpha):
-    BER = []
-
-    # num_of_adc_p = 2.0 ** parameters['num_of_adc_p']
-    #num_of_adc_p = 4
-    num_of_adc_p = 1
-    num_samples_L_tilde = 2.0 ** parameters['num_samples_L_tilde']
-    num_code_words = 2.0 ** (2.0 ** parameters['num_code_words'])
-    overall_bits = int(round(num_of_adc_p)) * int(round(num_samples_L_tilde)) * int(round(np.log2(num_code_words)))
-
-    test_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, test_size), p=[0.5, 0.5])
-    labels_test = np.sum(0.5 * (test_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)), axis=1).astype(
-        np.long)
-    for r, ro in enumerate(np.flip(snr_vals)):
-
-        test_samples = create_received_signal(test_data, ro).T
-        test_set = []
-
-        for i in range(len(test_samples)):
-            test_set.append([test_samples[i], labels_test[i]])
-
-        best_net = net
-        net_test = best_net
-
-        print('p: ', num_of_adc_p, ', actual: ', int(round(num_of_adc_p)))
-        print('L: ', num_samples_L_tilde, ', actual: ', int(round(num_samples_L_tilde)))
-        print('code_words: ', num_code_words, 'bits: ', int(round(np.log2(num_code_words))))
-        print('overall bits: ', overall_bits)
-
-        net_test.eval()
-        net_test.sampling_layer = HardSamplingLayer(best_net.sampling_layer.weight, int(round(num_of_adc_p)),
-                                                    int(round(num_samples_L_tilde)))
-        net_test.quantization_layer = HardQuantizationLayer(best_net.quantization_layer.a,
-                                                            best_net.quantization_layer.b,
-                                                            best_net.quantization_layer.c, int(round(num_code_words)))
-        with torch.no_grad():
-            cur_error = []
-            for i, data in tqdm(enumerate(DataLoader(test_set, batch_size=batch_size))):
-                inputs, labels = data
-                inputs = inputs.to(device)
-                net_outputs = net_test(inputs)
-                outputs = net_outputs.argmax(dim=1)
-                power = 2 ** np.flip(np.arange(num_transmitted_symbols))
-                est_ber = np.floor((outputs.cpu().numpy()[:, None] % (2 * power)) / power).T
-                est_ber_scale = 2 * est_ber - np.ones((num_transmitted_symbols, batch_size))
-                cur_error.append(
-                    np.mean(np.mean(est_ber_scale != test_data[:, i * batch_size:(i + 1) * batch_size], axis=0)))
-            BER.append(sum(cur_error) / len(cur_error))
-    return sum(BER) / len(BER) + alpha * overall_bits
+def train_evaluate(trainer, parameterization, alpha):
+    net = trainer.train(create_received_signal, parameterization)
+    return trainer.evaluate(parameterization, net, alpha)
 
 
-def evaluate_plot(parameters, net):
-    BER = []
-    test_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, test_size), p=[0.5, 0.5])
-    labels_test = np.sum(0.5 * (test_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)), axis=1).astype(
-        np.long)
-    for r, ro in enumerate(np.flip(snr_vals)):
-        test_samples = create_received_signal(test_data, ro).T
-        test_set = []
-
-        for i in range(len(test_samples)):
-            test_set.append([test_samples[i], labels_test[i]])
-
-        best_net = net
-        net_test = deepcopy(best_net)
-
-        # num_of_adc_p = 2.0 ** parameters['num_of_adc_p']
-        # num_of_adc_p = 4
-        num_of_adc_p = 1
-        num_samples_L_tilde = 2.0 ** parameters['num_samples_L_tilde']
-        num_code_words = 2.0 ** (2.0 ** parameters['num_code_words'])
-
-        print('p: ', num_of_adc_p, ', actual: ', int(round(num_of_adc_p)))
-        print('L: ', num_samples_L_tilde, ', actual: ', int(round(num_samples_L_tilde)))
-        print('code_words: ', num_code_words, 'bits: ', int(round(np.log2(num_code_words))))
-        overall_bits = int(round(num_of_adc_p)) * int(round(num_samples_L_tilde)) * int(round(np.log2(num_code_words)))
-        print('overall bits: ', overall_bits)
-
-        net_test.eval()
-        net_test.sampling_layer = HardSamplingLayer(best_net.sampling_layer.weight, int(round(num_of_adc_p)),
-                                                    int(round(num_samples_L_tilde)))
-        net_test.quantization_layer = HardQuantizationLayer(best_net.quantization_layer.a,
-                                                            best_net.quantization_layer.b,
-                                                            best_net.quantization_layer.c, int(round(num_code_words)))
-        with torch.no_grad():
-            cur_error = []
-            for i, data in tqdm(enumerate(DataLoader(test_set, batch_size=batch_size))):
-                inputs, labels = data
-                inputs = inputs.to(device)
-                net_outputs = net_test(inputs)
-                outputs = net_outputs.argmax(dim=1)
-                power = 2 ** np.flip(np.arange(num_transmitted_symbols))
-                est_ber = np.floor((outputs.cpu().numpy()[:, None] % (2 * power)) / power).T
-                est_ber_scale = 2 * est_ber - np.ones((num_transmitted_symbols, batch_size))
-                cur_error.append(
-                    np.mean(np.mean(est_ber_scale != test_data[:, i * batch_size:(i + 1) * batch_size], axis=0)))
-            BER.append(sum(cur_error) / len(cur_error))
-    print('The BER for this trial:', BER)
-    return BER
-
-
-def train_evaluate(parameterization, alpha):
-    net = train(create_received_signal, parameterization, training_set)
-    return evaluate(parameterization, net, alpha)
-
-
-def hyperparameter_optimization(training_set, alpha):
+def custom_optimize(lower_bound, upper_bound, alpha, bits_upper_bound):
     best_parameters, values, experiment, model = optimize(
         parameters=[
-            # {"name": "num_of_adc_p", "type": "range", "bounds": [0.0, np.log2(25)]},
+            {"name": "num_of_adc_p", "type": "range", "bounds": [lower_bound["p"], np.log2(upper_bound["p"])]},
             {"name": "num_samples_L_tilde", "type": "range",
-             "bounds": [float(np.log2(3.0)), float(np.log2(8.0))]}, #25.0
+             "bounds": [float(np.log2(lower_bound["L"])), float(np.log2(upper_bound["L"]))]},
             {"name": "num_code_words", "type": "range",
-             "bounds": [float(np.log2(3.0)), float(np.log2(8.0))],"log_scale": True},#25.0
+             "bounds": [float(np.log2(np.log2(lower_bound["M"]))), float(np.log2(np.log2(upper_bound["M"])))]},
         ],
-        evaluation_function=lambda parameterization: train_evaluate(parameterization, alpha),
+        evaluation_function=lambda parameterization: train_evaluate(trainer, parameterization, alpha),
         objective_name='Bit Error Rate', minimize=True,
-        parameter_constraints=['num_samples_L_tilde + num_code_words <= 5']
-        , total_trials=25)  # 'num_of_adc_p + num_samples_L_tilde + num_code_words <= 4.90689059561' 5.1292830169
-    best_parameters['num_of_adc_p'] = 1 #4
-    net = train(create_received_signal, best_parameters, training_set)
-    BER = evaluate_plot(best_parameters, net)
+        parameter_constraints=['num_of_adc_p + num_samples_L_tilde + num_code_words <= ' + str(bits_upper_bound)]
+        , total_trials=params.num_trials)  # 25
+    return best_parameters, values, experiment, model
+
+
+def hyperparameter_optimization(trainer, alpha):
+    if params.settings == "large":
+        best_parameters, values, experiment, model = custom_optimize({"p": 0.0, "L": 3.0, "M": 3.0},
+                                                                     {"p": 16.0, "L": 16.0, "M": 16.0}, alpha,
+                                                                     np.log2(max_bits))
+    else:
+        best_parameters, values, experiment, model = custom_optimize({"p": 0.0, "L": 3.0, "M": 3.0},
+                                                                     {"p": 8.0, "L": 12.0, "M": 12.0}, alpha,
+                                                                     np.log2(max_bits))
+    net = trainer.train(create_received_signal, best_parameters)
+    BER = trainer.evaluate_plot(best_parameters, net)
 
     for r, ro in enumerate(BER):
         print('ro = ', r, ' BER: ', ro)
@@ -524,92 +507,146 @@ def plot_BER_vs_iterations(alpha, experiment):
         ))
 
 
-def plot_original_vs_optimized(BER, BER_ORIGINAL, best_parameters, original_parameters, alphas):
-    colors = ['green', 'orange', 'purple']
-    if alphas:
-        for ber, best_params, alpha, color in zip(BER, best_parameters, alphas, colors):
-            # best_p = best_params['num_of_adc_p']
-            #best_p = 2
-            best_p = 0
-            best_L_tilde = best_params['num_samples_L_tilde']
-            best_code_words = best_params['num_code_words']
-            plt.plot(np.arange(13), ber, marker='o', linestyle='dashed', color=color,
-                     label='Perfect CSI optimized - alpha=' + str(alpha) + ' p = ' + str(
-                         int(round(2.0 ** best_p))) + ',L_tilde = ' + str(
-                         int(round(2.0 ** best_L_tilde))) + ',Code Words = ' + str(
-                         int(round(2.0 ** best_code_words))) + ',Bits used: ' + str(
-                         int(round(2.0 ** best_p)) * int(round(2.0 ** best_L_tilde)) * int(
-                             round(best_code_words))))
-    plt.plot(np.arange(13), BER_ORIGINAL, marker='o', color='blue',
-             label='Perfect CSI not optimized' + ' p = ' + str(
-                 original_parameters['num_of_adc_p']) + ' L_tilde = ' +
-                   str(int(round(2.0 ** original_parameters['num_samples_L_tilde']))) + ' Code Words = ' + str(
-                 int(round(2.0 ** (2.0 ** original_parameters['num_code_words'])))) + ' Bits used: ' + str(
-                 original_parameters['num_of_adc_p'] * int(
-                     round(2.0 ** original_parameters['num_samples_L_tilde'])) * int(
-                     round(2.0 ** original_parameters[
-                         'num_code_words']))))
-    plt.title('BER vs SNR')
-    plt.ylabel('BER')
-    plt.xlabel('SNR[db]')
-    plt.yscale('log')
-    plt.ylim((10 ** (-6), 1))
+def plot_original_vs_optimized():
+    data = sio.loadmat("BER.mat")
+    small_alpha = data["alpha1"][0]
+    medium_alpha = data["alpha2"][0]
+    large_alpha = data["alpha3"][0]
+    non_optimized = data["non-optimized"][0]
+    snr = np.arange(13)
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "Helvetica"
+    })
+    plt.plot(snr, small_alpha, color="b", marker="^", markersize=9, linewidth=1, markeredgewidth=0.5, fillstyle="none",
+             zorder=10,
+             clip_on=False,
+             label=r'Meta-Learned $\displaystyle\alpha=0.0005: \{p,\tilde{L},\tilde{M}\}=\{2,4,16\};$ 32 bits'
+             )
+    plt.plot(snr, medium_alpha, color="r", marker="v", markersize=9, linewidth=1, markeredgewidth=0.5, fillstyle="none",
+             zorder=10,
+             clip_on=False,
+             label=r'Meta-Learned $\displaystyle\alpha=0.005: \{p,\tilde{L},\tilde{M}\}=\{2,3,8\};$ 18 bits')
+    plt.plot(snr, large_alpha, "g", marker=">", markersize=9, linewidth=1, markeredgewidth=0.5, fillstyle="none",
+             zorder=10, clip_on=False,
+             label=r'Meta-Learned $\displaystyle\alpha=0.05: \{p,\tilde{L},\tilde{M}\}=\{1,3,4\};$ 6 bits')
+    plt.plot(snr, non_optimized, "k", linewidth=1, linestyle="dashed",
+             label=r'Fixed acquisition: $\displaystyle \{p,\tilde{L},\tilde{M}\}=\{1,6,256\};$ 48 bits')
+    plt.grid(which="both", linestyle='dashed', zorder=10)
+    plt.xlim(0, 12)
+    plt.ylim(1e-5, 1)
+    plt.tick_params(bottom=True, top=True, left=True, right=True, direction='in')
+    plt.xlabel("SNR [dB]")
+    plt.ylabel("Error rate")
+    plt.yscale("log")
     plt.legend()
-    plt.savefig('result.png')
     plt.show()
 
 
 if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--settings', required=False, default='large',
+                        help='large settings n=16 k=8, small settings n=6 k=4')
+    parser.add_argument('--num_trials', type=int, default=25, help='num of trials hyperparameter optimization')
+    parser.add_argument('--lr', type=float, default=5e-3, help='learning rate')
+    parser.add_argument('--dense_sampling_L', type=int, default=20, help='Observed discretized time frame')
+    parser.add_argument('--valid_percent', type=float, default=0.3,
+                        help='Percentage of training data used for validation')
+    parser.add_argument('--train_size', type=int, default=int(1e4), help='train size')
+    parser.add_argument('--test_size', type=int, default=int(1e5), help='test size')
+    parser.add_argument('--error_variance', type=float, default=0.1, help='error variance for csi uncertainty')
+    parser.add_argument('--frame_size', type=int, default=200, help='frame size')
+    parser.add_argument('--f_0', type=float, default=1e3, help='f0')
+    parser.add_argument('--num_of_snr', type=int, default=13, help='number of snr values to test')
+    parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
+    parser.add_argument('--batch_size', type=int, default=100, help='batch size')
+    parser.add_argument('--gaussian_sampling_std', type=float, default=0.4, help='gaussian sampling std')
+    params = parser.parse_args()
+
+    ###########################
+    # Parmeters Intialization #
+    ###########################
+
+    if params.settings == "large":
+        num_rx_antenas = 16  # Number of Rx antennas
+        num_transmitted_symbols = 8  # Number of transmitted symbols
+        max_bits = 150
+    else:
+        num_rx_antenas = 6  # Number of Rx antennas
+        num_transmitted_symbols = 4  # Number of transmitted symbols
+        max_bits = 24
+    validation_size = int(params.train_size * params.valid_percent)
+    BPSK_symbols = [-1, 1]  # BPSK symbols
+    w = 2 * np.pi * params.f_0
+    snr_vals = 10 ** (-0.1 * np.arange(params.num_of_snr))
+    num_workers = 0
+    time_vec = np.arange(1, params.dense_sampling_L + 1) / params.dense_sampling_L
+    channel_matrix_cos = 1 + 0.5 * np.cos(time_vec)
+    noise_vector = 1 + 0.3 * np.cos(1.5 * (np.arange(1, params.dense_sampling_L + 1)) + 0.2)
+
+    if torch.cuda.is_available():
+        dev = "cuda:0"
+    else:
+        dev = "cpu"
+    device = torch.device(dev)
+
+    BITS_ERR_MSG = '**************too much bits*****************'
+
+    ###########################
+    # channel matrix creation #
+    ###########################
+
+    channel_matrix_exp = np.exp(-np.abs(np.ones((num_rx_antenas, 1)) * np.arange(num_transmitted_symbols) - (
+            np.ones((num_transmitted_symbols, 1)) * [np.arange(num_rx_antenas)]).T))
 
     #################
     # Data Creation #
     #################
 
     ro_train = snr_vals[0]
-    train_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, train_size), p=[0.5, 0.5])
+    train_data = np.random.choice(BPSK_symbols, (num_transmitted_symbols, params.train_size), p=[0.5, 0.5])
     labels_train = np.sum(0.5 * (train_data + 1).T * 2 ** np.flip(np.arange(num_transmitted_symbols)), axis=1).astype(
-        np.long)
+        int)
     train_samples = create_received_signal(train_data, ro_train).T
     training_set = []
 
     for i in range(len(train_samples)):
         training_set.append([train_samples[i], labels_train[i]])
+    training_set = LoadData(training_set)
+    alphas = [5e-4, 5e-3, 5e-2]
 
-    alphas = [1e-4, 0.005, 0.09]
-
-    # original_parameters = {'num_of_adc_p': 4, 'num_samples_L_tilde': float(np.log2(4.0)),
-    #                        'num_code_words': float(np.log2(8.0))}
-
-    original_parameters = {'num_of_adc_p': 1, 'num_samples_L_tilde': float(np.log2(6.0)),
-                           'num_code_words': float(np.log2(8.0))}
+    original_parameters = {'num_of_adc_p': np.log2(4 if params.settings == "large" else 1),
+                           'num_samples_L_tilde': np.log2(6),
+                           'num_code_words': np.log2(np.log2(256))}
 
     ####################################################
     # Train the model with hyperparameter optimization #
     ####################################################
-
-    BER_0, best_parameters_0, values_0, experiment_0, model_0 = hyperparameter_optimization(training_set, alphas[0])
-    # plot_hyperparameters_contours(alphas[0], model_0)
+    train_loader = DataLoader(training_set, batch_size=params.batch_size, num_workers=num_workers)
+    trainer = Trainer(train_loader)
+    net_original = trainer.train(create_received_signal, original_parameters)
+    BER_ORIGINAL = trainer.evaluate_plot(original_parameters, net_original)
+    BER_0, best_parameters_0, values_0, experiment_0, model_0 = hyperparameter_optimization(trainer, alphas[0])
+    plot_hyperparameters_contours(alphas[0], model_0)
     plot_BER_vs_iterations(alphas[0], experiment_0)
 
-    BER_1, best_parameters_1, values_1, experiment_1, model_1 = hyperparameter_optimization(training_set, alphas[1])
-    # plot_hyperparameters_contours(alphas[1], model_1)
+    BER_1, best_parameters_1, values_1, experiment_1, model_1 = hyperparameter_optimization(trainer, alphas[1])
+    plot_hyperparameters_contours(alphas[1], model_1)
     plot_BER_vs_iterations(alphas[1], experiment_1)
 
-    BER_2, best_parameters_2, values_2, experiment_2, model_2 = hyperparameter_optimization(training_set, alphas[2])
-    # # plot_hyperparameters_contours(alphas[2], model_2)
+    BER_2, best_parameters_2, values_2, experiment_2, model_2 = hyperparameter_optimization(trainer, alphas[2])
+    plot_hyperparameters_contours(alphas[2], model_2)
     plot_BER_vs_iterations(alphas[2], experiment_2)
 
     ####################################################
     #   Train the model with original hyperparmeters   #
     ####################################################
 
-    net_original = train(create_received_signal, original_parameters, training_set)
-    BER_ORIGINAL = evaluate_plot(original_parameters, net_original)
     BER = [BER_0, BER_1, BER_2]
-    ber_dict = {'alpha=1e-4': BER_0, 'alpha=0.005': BER_1, 'alpha=0.04': BER_2, 'non-optimized': BER_ORIGINAL}
+    ber_dict = {'alpha1': BER_0, 'alpha2': BER_1, 'alpha3': BER_2, 'non-optimized': BER_ORIGINAL}
     all_ber_dict = {'all': np.array([BER_0, BER_1, BER_2, BER_ORIGINAL])}
     savemat('BER.mat', ber_dict)
     savemat('all_BER.mat', all_ber_dict)
     best_parameters = [best_parameters_0, best_parameters_1, best_parameters_2]
-    plot_original_vs_optimized(BER, BER_ORIGINAL, best_parameters, original_parameters, alphas)
-    # plot_original_vs_optimized([], BER_ORIGINAL, {}, original_parameters, None)
+    plot_original_vs_optimized()
